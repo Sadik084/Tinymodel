@@ -1,8 +1,6 @@
 name: Train TinyLM
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -38,7 +36,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add toy_model.npz
           git commit -m "Update TinyLM model [skip ci]" || echo "No changes to commit"
-          git push origin HEAD:main
+          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/Sadik084/Tinymodel.git HEAD:main
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
