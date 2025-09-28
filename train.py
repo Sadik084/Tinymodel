@@ -134,12 +134,20 @@ def main(data_dir="./data", checkpoint="toy_model.npz", epochs=10):
     if os.path.exists(checkpoint):
         print("🔄 Updating existing model...")
         weights = np.load(checkpoint, allow_pickle=True)
-        meta = json.loads(str(weights["meta"]))
-        stoi, itos = meta["stoi"], {int(k): v for k, v in meta["itos"].items()}
-        vocab_size = len(stoi)
+        if "meta" in weights:
+            meta = json.loads(str(weights["meta"]))
+            stoi, itos = meta["stoi"], {int(k): v for k, v in meta["itos"].items()}
+            vocab_size = len(stoi)
+        else:
+            print("⚠️ No metadata found, building vocab from current data...")
+            vocab, stoi, itos = build_vocab(text)
+            vocab_size = len(stoi)
+            meta = {"stoi": stoi, "itos": itos, "file_hashes": {}}
 
         model = TinyLM(vocab_size)
-        model.W_emb = weights["W_emb"]
+        # Only set weights if they match
+        if model.W_emb.shape == weights["W_emb"].shape:
+            model.W_emb = weights["W_emb"]
         model.W1 = weights["W1"]
         model.b1 = weights["b1"]
         model.W2 = weights["W2"]
@@ -158,13 +166,13 @@ def main(data_dir="./data", checkpoint="toy_model.npz", epochs=10):
 
         meta = {"stoi": stoi, "itos": itos, "file_hashes": file_hashes}
 
-    # Save model + metadata
+    # Save model + metadata in a single npz
     meta_str = json.dumps(meta)
     np.savez(checkpoint,
              W_emb=model.W_emb, W1=model.W1, b1=model.b1,
              W2=model.W2, b2=model.b2,
              meta=np.array(meta_str))
-    print("✅ Model saved:", checkpoint)
+    print("✅ Model + metadata saved:", checkpoint)
 
 if __name__ == "__main__":
     main()
