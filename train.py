@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import numpy as np
+import pandas as pd
 from glob import glob
 from collections import Counter
 from tqdm import tqdm
@@ -12,6 +13,56 @@ from tqdm import tqdm
 def md5sum(filename):
     with open(filename, "rb") as f:
         return hashlib.md5(f.read()).hexdigest()
+
+def convert_datasets_to_txt(data_dir="./data"):
+    os.makedirs(data_dir, exist_ok=True)
+    converted_files = []
+
+    for fname in os.listdir(data_dir):
+        full_path = os.path.join(data_dir, fname)
+        name, ext = os.path.splitext(fname.lower())
+        out_file = os.path.join(data_dir, f"{name}.txt")
+
+        if os.path.exists(out_file) or ext == ".txt":
+            continue
+
+        lines = []
+        try:
+            if ext in [".csv", ".tsv"]:
+                sep = "," if ext == ".csv" else "\t"
+                df = pd.read_csv(full_path, sep=sep, encoding="utf-8", header=None, on_bad_lines='skip')
+                lines = df.iloc[:, -1].dropna().astype(str).tolist()
+
+            elif ext == ".json":
+                with open(full_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict):
+                                for key in ["utterances", "lines", "text"]:
+                                    if key in item:
+                                        if isinstance(item[key], list):
+                                            lines.extend([str(x) for x in item[key]])
+                                        else:
+                                            lines.append(str(item[key]))
+                    elif isinstance(data, dict):
+                        for key in ["utterances", "lines", "text"]:
+                            if key in data:
+                                if isinstance(data[key], list):
+                                    lines.extend([str(x) for x in data[key]])
+                                else:
+                                    lines.append(str(data[key]))
+
+            if lines:
+                with open(out_file, "w", encoding="utf-8") as f:
+                    for line in lines:
+                        f.write(line.strip() + "\n")
+                converted_files.append(out_file)
+                print(f"Converted {fname} → {out_file}")
+        except Exception as e:
+            print(f"Failed to convert {fname}: {e}")
+
+    return converted_files
 
 def load_corpus(data_dir):
     texts = []
@@ -57,6 +108,22 @@ class TinyLM:
         logits = h @ self.W2 + self.b2
         return logits, h
 
+    def expand_vocab(self, new_words):
+        new_size = self.vocab_size + len(new_words)
+        # Expand embedding
+        new_W_emb = np.random.randn(len(new_words), self.emb_dim) * 0.01
+        self.W_emb = np.vstack([self.W_emb, new_W_emb])
+        # Expand output layer
+        new_W2 = np.random.randn(self.hidden_dim, len(new_words)) * 0.01
+        self.W2 = np.hstack([self.W2, new_W2])
+        new_b2 = np.zeros((1, len(new_words)))
+        self.b2 = np.hstack([self.b2, new_b2])
+        self.vocab_size = new_size
+        print(f"Expanded model vocabulary by {len(new_words)} words → New vocab size: {self.vocab_size}")
+
+# ==========================================================
+# Training utils
+# ==========================================================
 def softmax(x):
     x = x - np.max(x, axis=1, keepdims=True)
     return np.exp(x) / np.exp(x).sum(axis=1, keepdims=True)
@@ -119,39 +186,44 @@ def train(model, data, epochs=5, lr=0.01, batch_size=32):
         print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {total_loss/steps:.4f}")
 
 # ==========================================================
-# Main Auto-Update Training
+# Main Auto-Update Training with Dynamic Expansion
 # ==========================================================
 def main(data_dir="./data", checkpoint="toy_model.npz", epochs=10):
     os.makedirs(data_dir, exist_ok=True)
 
-    # Load new data
+    # 1️⃣ Convert CSV/JSON datasets to txt
+    convert_datasets_to_txt(data_dir)
+
+    # 2️⃣ Load corpus
     text, file_hashes = load_corpus(data_dir)
     if not text.strip():
         print("No text data found in ./data folder.")
         return
 
-    # If checkpoint exists → load & continue training
+    # 3️⃣ Load existing model or create new
     if os.path.exists(checkpoint):
         print("🔄 Updating existing model...")
         weights = np.load(checkpoint, allow_pickle=True)
-        if "meta" in weights:
-            meta = json.loads(str(weights["meta"]))
-            stoi, itos = meta["stoi"], {int(k): v for k, v in meta["itos"].items()}
-            vocab_size = len(stoi)
-        else:
-            print("⚠️ No metadata found, building vocab from current data...")
-            vocab, stoi, itos = build_vocab(text)
-            vocab_size = len(stoi)
-            meta = {"stoi": stoi, "itos": itos, "file_hashes": {}}
+        meta = json.loads(str(weights["meta"]))
+        stoi, itos = meta["stoi"], {int(k): v for k, v in meta["itos"].items()}
+        vocab_size = len(stoi)
 
         model = TinyLM(vocab_size)
-        # Only set weights if they match
-        if model.W_emb.shape == weights["W_emb"].shape:
-            model.W_emb = weights["W_emb"]
+        model.W_emb = weights["W_emb"]
         model.W1 = weights["W1"]
         model.b1 = weights["b1"]
         model.W2 = weights["W2"]
         model.b2 = weights["b2"]
+
+        # Check for new words in data
+        tokens = set(text.strip().split())
+        new_words = [tok for tok in tokens if tok not in stoi]
+        if new_words:
+            model.expand_vocab(new_words)
+            for i, tok in enumerate(new_words):
+                idx = vocab_size + i
+                stoi[tok] = idx
+                itos[idx] = tok
 
         data = encode(text, stoi)
         train(model, data, epochs=epochs, lr=0.01, batch_size=64)
@@ -166,13 +238,13 @@ def main(data_dir="./data", checkpoint="toy_model.npz", epochs=10):
 
         meta = {"stoi": stoi, "itos": itos, "file_hashes": file_hashes}
 
-    # Save model + metadata in a single npz
+    # 4️⃣ Save model + metadata
     meta_str = json.dumps(meta)
     np.savez(checkpoint,
              W_emb=model.W_emb, W1=model.W1, b1=model.b1,
              W2=model.W2, b2=model.b2,
              meta=np.array(meta_str))
-    print("✅ Model + metadata saved:", checkpoint)
+    print("✅ Model saved:", checkpoint)
 
 if __name__ == "__main__":
     main()
