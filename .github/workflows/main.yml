@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy tqdm pandas
+          pip install tensorflow numpy pandas tqdm
 
       - name: Run training
         run: python train.py
