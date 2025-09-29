@@ -1,95 +1,79 @@
+
 #!/usr/bin/env python3
-# train_fast.py
-"""
-Faster TinyLM training using:
- - float32 for weights/activations
- - BLAS thread control via env vars
- - Numba JIT for heavy forward/backward & embedding scatter-add
-"""
 
 import os
-# Set these BEFORE importing numpy so BLAS/MKL picks them up
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() or 1)
-os.environ["MKL_NUM_THREADS"] = str(os.cpu_count() or 1)
-os.environ["OPENBLAS_NUM_THREADS"] = str(os.cpu_count() or 1)
-
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # force TensorFlow to use CPU only
+import argparse
 import json
 import hashlib
 from glob import glob
 from collections import Counter
-from tqdm import tqdm
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
-# Try to import numba; if unavailable, we proceed but slower
-try:
-    from numba import njit, prange
-    NUMBA_AVAILABLE = True
-except Exception:
-    NUMBA_AVAILABLE = False
+import tensorflow as tf
 
 # -------------------------
 # Utilities
 # -------------------------
 def md5sum(filename):
+    h = hashlib.md5()
     with open(filename, "rb") as f:
-        return hashlib.md5(f.read()).hexdigest()
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def convert_datasets_to_txt(data_dir="./data"):
     os.makedirs(data_dir, exist_ok=True)
     converted_files = []
-
     for fname in os.listdir(data_dir):
         full_path = os.path.join(data_dir, fname)
         name, ext = os.path.splitext(fname.lower())
         out_file = os.path.join(data_dir, f"{name}.txt")
-
-        if os.path.exists(out_file) or ext == ".txt":
+        if ext == ".txt" or os.path.exists(out_file):
             continue
-
         lines = []
         try:
             if ext in [".csv", ".tsv"]:
                 sep = "," if ext == ".csv" else "\t"
-                df = pd.read_csv(full_path, sep=sep, encoding="utf-8", header=None, on_bad_lines='skip')
+                df = pd.read_csv(full_path, sep=sep, encoding="utf-8", header=None, on_bad_lines="skip")
+                # use last column as text candidate
                 lines = df.iloc[:, -1].dropna().astype(str).tolist()
-
             elif ext == ".json":
                 with open(full_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, list):
                         for item in data:
                             if isinstance(item, dict):
-                                for key in ["utterances", "lines", "text"]:
+                                for key in ("utterances","lines","text"):
                                     if key in item:
                                         if isinstance(item[key], list):
                                             lines.extend([str(x) for x in item[key]])
                                         else:
                                             lines.append(str(item[key]))
                     elif isinstance(data, dict):
-                        for key in ["utterances", "lines", "text"]:
+                        for key in ("utterances","lines","text"):
                             if key in data:
                                 if isinstance(data[key], list):
                                     lines.extend([str(x) for x in data[key]])
                                 else:
                                     lines.append(str(data[key]))
-
             if lines:
                 with open(out_file, "w", encoding="utf-8") as f:
                     for line in lines:
                         f.write(line.strip() + "\n")
                 converted_files.append(out_file)
-                print(f"Converted {fname} → {out_file}")
+                print(f"Converted {fname} -> {out_file}")
         except Exception as e:
             print(f"Failed to convert {fname}: {e}")
-
     return converted_files
 
-def load_corpus(data_dir):
+def load_corpus(data_dir="./data"):
     texts = []
     file_hashes = {}
-    for fname in glob(os.path.join(data_dir, "*.txt")):
+    for fname in sorted(glob(os.path.join(data_dir, "*.txt"))):
         with open(fname, "r", encoding="utf-8") as f:
             texts.append(f.read())
         file_hashes[fname] = md5sum(fname)
@@ -105,332 +89,214 @@ def build_vocab(text, min_freq=1, max_vocab=50000):
     itos = {i: s for s, i in stoi.items()}
     return vocab, stoi, itos
 
-def encode(text, stoi):
-    return np.array([stoi.get(tok, stoi["<UNK>"]) for tok in text.strip().split()], dtype=np.int64)
+def encode_to_ids(text, stoi):
+    return np.array([stoi.get(tok, stoi["<UNK>"]) for tok in text.strip().split()], dtype=np.int32)
 
 # -------------------------
-# Model (lightweight)
+# Model helpers
 # -------------------------
-class TinyLM:
-    def __init__(self, vocab_size, emb_dim=64, hidden_dim=256, context_size=4, dtype=np.float32):
-        self.dtype = dtype
-        self.vocab_size = int(vocab_size)
-        self.emb_dim = int(emb_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.context_size = int(context_size)
+def build_model(vocab_size, emb_dim=64, context_size=2):
+    """
+    Simple CBOW-like model: embed context tokens, flatten, linear to vocab logits.
+    """
+    inputs = tf.keras.Input(shape=(context_size*2,), dtype=tf.int32, name="context")
+    x = tf.keras.layers.Embedding(input_dim=vocab_size, output_dim=emb_dim, name="embed")(inputs)
+    x = tf.keras.layers.Reshape((context_size*2*emb_dim,))(x)
+    x = tf.keras.layers.Dense(units=emb_dim*2, activation="tanh")(x)
+    logits = tf.keras.layers.Dense(units=vocab_size, activation=None, name="logits")(x)
+    model = tf.keras.Model(inputs=inputs, outputs=logits)
+    return model
 
-        # Initialize in float32
-        self.W_emb = (np.random.randn(self.vocab_size, self.emb_dim).astype(self.dtype)) * 0.01
-        self.W1 = (np.random.randn(self.context_size * self.emb_dim, self.hidden_dim).astype(self.dtype)) * 0.01
-        self.b1 = np.zeros((1, self.hidden_dim), dtype=self.dtype)
-        self.W2 = (np.random.randn(self.hidden_dim, self.vocab_size).astype(self.dtype)) * 0.01
-        self.b2 = np.zeros((1, self.vocab_size), dtype=self.dtype)
+def rebuild_and_load_weights(old_model, new_vocab_size, checkpoint_weights):
+    """
+    Rebuild a model with new_vocab_size and copy weights from old model where possible.
+    checkpoint_weights is a dict mapping layer name -> numpy array weights
+    """
+    new_model = build_model(new_vocab_size,
+                            emb_dim=old_model.get_layer("embed").output_shape[-1],
+                            context_size=(old_model.input_shape[1] // 2))
+    # Build model by calling with dummy input
+    dummy = np.zeros((1, new_model.input_shape[1]), dtype=np.int32)
+    new_model(dummy, training=False)
 
-    def expand_vocab(self, new_words):
-        add = len(new_words)
-        if add == 0:
-            return
-        new_W_emb = (np.random.randn(add, self.emb_dim).astype(self.dtype)) * 0.01
-        self.W_emb = np.vstack([self.W_emb, new_W_emb])
+    # Copy embedding weights
+    old_emb_w = checkpoint_weights.get("embed/embeddings:0")
+    if old_emb_w is not None:
+        # old_emb_w shape (old_vocab, emb_dim)
+        emb_layer = new_model.get_layer("embed")
+        new_emb_w = emb_layer.get_weights()[0]
+        n_copy = min(old_emb_w.shape[0], new_emb_w.shape[0])
+        new_emb_w[:n_copy] = old_emb_w[:n_copy]
+        emb_layer.set_weights([new_emb_w])
 
-        new_W2 = (np.random.randn(self.hidden_dim, add).astype(self.dtype)) * 0.01
-        self.W2 = np.hstack([self.W2, new_W2])
+    # Copy logits Dense weights (kernel and bias)
+    old_logits_kernel = checkpoint_weights.get("logits/kernel:0")
+    old_logits_bias = checkpoint_weights.get("logits/bias:0")
+    try:
+        logits_layer = new_model.get_layer("logits")
+        new_kernel, new_bias = logits_layer.get_weights()
+        if old_logits_kernel is not None:
+            # old shape (hidden, old_vocab)
+            hk_old, ov = old_logits_kernel.shape
+            hk_new, nv = new_kernel.shape
+            # copy matching rows/cols
+            hk_copy = min(hk_old, hk_new)
+            nv_copy = min(ov, nv)
+            new_kernel[:hk_copy, :nv_copy] = old_logits_kernel[:hk_copy, :nv_copy]
+        if old_logits_bias is not None:
+            nb_copy = min(old_logits_bias.shape[0], new_bias.shape[0])
+            new_bias[:nb_copy] = old_logits_bias[:nb_copy]
+        logits_layer.set_weights([new_kernel, new_bias])
+    except Exception:
+        pass
 
-        new_b2 = np.zeros((1, add), dtype=self.dtype)
-        self.b2 = np.hstack([self.b2, new_b2])
-
-        self.vocab_size += add
-        print(f"Expanded model vocabulary by {add} words → New vocab size: {self.vocab_size}")
-
-# -------------------------
-# Numba-accelerated batch gradients
-# -------------------------
-if NUMBA_AVAILABLE:
-    @njit(parallel=True, fastmath=True)
-    def batch_grads_numba(W_emb, W1, b1, W2, b2, Xb, Yb, context_size, emb_dim, hidden_dim):
-        """
-        Compute logits, loss and gradients for a single batch.
-        Returns:
-         loss (float), dW_emb, dW1, db1, dW2, db2
-        """
-        N = Xb.shape[0]
-        vocab_size = W_emb.shape[0]
-
-        # Embedding lookup -> (N, context_size*emb_dim)
-        emb_mat = np.empty((N, context_size * emb_dim), dtype=W_emb.dtype)
-        for i in prange(N):
-            row = emb_mat[i]
-            pos = 0
-            for j in range(context_size):
-                idx = Xb[i, j]
-                for k in range(emb_dim):
-                    row[pos + k] = W_emb[idx, k]
-                pos += emb_dim
-
-        # Hidden activations
-        h = np.empty((N, hidden_dim), dtype=W1.dtype)
-        for i in prange(N):
-            # h = tanh(emb @ W1 + b1)
-            for j in range(hidden_dim):
-                s = b1[0, j]
-                for k in range(context_size * emb_dim):
-                    s += emb_mat[i, k] * W1[k, j]
-                # tanh
-                h[i, j] = (np.tanh(s))
-
-        # logits = h @ W2 + b2
-        logits = np.empty((N, vocab_size), dtype=W2.dtype)
-        for i in prange(N):
-            for j in range(vocab_size):
-                s = b2[0, j]
-                for k in range(hidden_dim):
-                    s += h[i, k] * W2[k, j]
-                logits[i, j] = s
-
-        # softmax -> probs
-        probs = np.empty_like(logits)
-        loss = 0.0
-        for i in prange(N):
-            # numeric stabilization
-            m = logits[i, 0]
-            for j in range(1, vocab_size):
-                if logits[i, j] > m:
-                    m = logits[i, j]
-
-            denom = 0.0
-            for j in range(vocab_size):
-                denom += np.exp(logits[i, j] - m)
-
-            for j in range(vocab_size):
-                probs[i, j] = np.exp(logits[i, j] - m) / denom
-
-            y = Yb[i]
-            # accumulate negative log likelihood
-            loss -= np.log(probs[i, y] + 1e-12)
-
-        loss = loss / N
-
-        # dlogits
-        dlogits = np.empty_like(probs)
-        for i in prange(N):
-            for j in range(vocab_size):
-                dlogits[i, j] = probs[i, j]
-            dlogits[i, Yb[i]] -= 1.0
-        for i in prange(N):
-            for j in range(vocab_size):
-                dlogits[i, j] /= N
-
-        # dW2 = h.T @ dlogits
-        dW2 = np.zeros_like(W2)
-        for i in prange(hidden_dim):
-            for j in range(vocab_size):
-                s = 0.0
-                for n in range(N):
-                    s += h[n, i] * dlogits[n, j]
-                dW2[i, j] = s
-
-        # db2
-        db2 = np.zeros((1, vocab_size), dtype=W2.dtype)
-        for j in prange(vocab_size):
-            s = 0.0
-            for n in range(N):
-                s += dlogits[n, j]
-            db2[0, j] = s
-
-        # dh = dlogits @ W2.T
-        dh = np.empty((N, hidden_dim), dtype=W2.dtype)
-        for n in prange(N):
-            for i in range(hidden_dim):
-                s = 0.0
-                for j in range(vocab_size):
-                    s += dlogits[n, j] * W2[i, j]
-                dh[n, i] = s
-
-        # dh_raw = dh * (1 - h^2)
-        dh_raw = np.empty_like(dh)
-        for n in prange(N):
-            for i in range(hidden_dim):
-                dh_raw[n, i] = dh[n, i] * (1.0 - h[n, i] * h[n, i])
-
-        # dW1 = emb_mat.T @ dh_raw  -> shape (context*emb_dim, hidden_dim)
-        dW1 = np.zeros_like(W1)
-        for i in prange(context_size * emb_dim):
-            for j in range(hidden_dim):
-                s = 0.0
-                for n in range(N):
-                    s += emb_mat[n, i] * dh_raw[n, j]
-                dW1[i, j] = s
-
-        # db1
-        db1 = np.zeros((1, hidden_dim), dtype=W1.dtype)
-        for j in prange(hidden_dim):
-            s = 0.0
-            for n in range(N):
-                s += dh_raw[n, j]
-            db1[0, j] = s
-
-        # demb = dh_raw @ W1.T  -> (N, context*emb_dim)
-        demb_flat = np.empty((N, context_size * emb_dim), dtype=W1.dtype)
-        for n in prange(N):
-            for i in range(context_size * emb_dim):
-                s = 0.0
-                for j in range(hidden_dim):
-                    s += dh_raw[n, j] * W1[i, j]
-                demb_flat[n, i] = s
-
-        # reshape demb and scatter-add into dW_emb
-        dW_emb = np.zeros_like(W_emb)
-        for n in prange(N):
-            for c in range(context_size):
-                idx = Xb[n, c]
-                base = c * emb_dim
-                for k in range(emb_dim):
-                    dW_emb[idx, k] += demb_flat[n, base + k]
-
-        return loss, dW_emb, dW1, db1, dW2, db2
+    return new_model
 
 # -------------------------
-# NumPy fallback (no numba)
+# Dataset builder
 # -------------------------
-def batch_grads_numpy(W_emb, W1, b1, W2, b2, Xb, Yb, context_size, emb_dim, hidden_dim):
-    # Numpy version: same math but using numpy ops (works without numba)
-    N = Xb.shape[0]
-    # Embedding lookup
-    emb = W_emb[Xb].reshape(N, context_size * emb_dim).astype(W_emb.dtype)  # (N, context*emb)
-    h = np.tanh(emb.dot(W1) + b1)  # (N, hidden)
-    logits = h.dot(W2) + b2  # (N, vocab)
-    # softmax
-    logits_stable = logits - np.max(logits, axis=1, keepdims=True)
-    exp = np.exp(logits_stable)
-    probs = exp / np.sum(exp, axis=1, keepdims=True)
-    loss = -np.log(probs[np.arange(N), Yb] + 1e-12).mean()
-    # dlogits
-    dlogits = probs.copy()
-    dlogits[np.arange(N), Yb] -= 1.0
-    dlogits /= N
-    dW2 = h.T.dot(dlogits)
-    db2 = dlogits.sum(axis=0, keepdims=True)
-    dh = dlogits.dot(W2.T)
-    dh_raw = dh * (1 - h * h)
-    dW1 = emb.T.dot(dh_raw)
-    db1 = dh_raw.sum(axis=0, keepdims=True)
-    demb = dh_raw.dot(W1.T).reshape(N, context_size, emb_dim)
-    dW_emb = np.zeros_like(W_emb)
-    for i in range(context_size):
-        np.add.at(dW_emb, Xb[:, i], demb[:, i])
-    return loss, dW_emb, dW1, db1, dW2, db2
+def make_dataset(token_ids, context_size=2, batch_size=512, shuffle=True):
+    """
+    token_ids: 1D numpy array of token ids
+    Produces (context, target) pairs where context_size is number of tokens on each side.
+    """
+    cs = context_size
+    n = len(token_ids)
+    contexts = []
+    targets = []
+    for i in range(cs, n - cs):
+        left = token_ids[i-cs:i]
+        right = token_ids[i+1:i+1+cs]
+        context = np.concatenate([left, right])
+        target = token_ids[i]
+        contexts.append(context)
+        targets.append(target)
+    contexts = np.array(contexts, dtype=np.int32)
+    targets = np.array(targets, dtype=np.int32)
+    ds = tf.data.Dataset.from_tensor_slices((contexts, targets))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=min(200000, len(contexts)))
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
 
 # -------------------------
-# Batching
+# Main flow
 # -------------------------
-def make_batches(data, context_size, batch_size=512):
-    X, Y = [], []
-    for i in range(len(data) - context_size):
-        X.append(data[i:i+context_size])
-        Y.append(data[i+context_size])
-    X = np.array(X, dtype=np.int64)
-    Y = np.array(Y, dtype=np.int64)
-    idx = np.arange(len(X))
-    np.random.shuffle(idx)
-    for i in range(0, len(X), batch_size):
-        j = idx[i:i+batch_size]
-        yield X[j], Y[j]
+def main(args):
+    data_dir = args.data_dir
+    checkpoint_prefix = args.checkpoint
+    epochs = args.epochs
+    batch_size = args.batch_size
+    emb_dim = args.emb_dim
+    context_size = args.context_size
+    lr = args.lr
 
-# -------------------------
-# Training
-# -------------------------
-def train(model, data, epochs=5, lr=0.005, batch_size=512, use_numba=NUMBA_AVAILABLE):
-    for epoch in range(epochs):
-        total_loss = 0.0
-        steps = 0
-        batches = list(make_batches(data, model.context_size, batch_size))
-        pbar = tqdm(batches, desc=f"Epoch {epoch+1}/{epochs}", ncols=120)
-        for Xb, Yb in pbar:
-            # choose computation function
-            if use_numba and NUMBA_AVAILABLE:
-                loss, dW_emb, dW1, db1, dW2, db2 = batch_grads_numba(
-                    model.W_emb, model.W1, model.b1, model.W2, model.b2,
-                    Xb, Yb, model.context_size, model.emb_dim, model.hidden_dim
-                )
-            else:
-                loss, dW_emb, dW1, db1, dW2, db2 = batch_grads_numpy(
-                    model.W_emb, model.W1, model.b1, model.W2, model.b2,
-                    Xb, Yb, model.context_size, model.emb_dim, model.hidden_dim
-                )
-
-            # Gradient descent updates (in-place)
-            model.W_emb -= lr * dW_emb
-            model.W1 -= lr * dW1
-            model.b1 -= lr * db1
-            model.W2 -= lr * dW2
-            model.b2 -= lr * db2
-
-            total_loss += float(loss)
-            steps += 1
-            pbar.set_postfix({"loss": f"{total_loss/steps:.4f}"})
-        print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {total_loss/steps:.6f}")
-
-# -------------------------
-# Main Auto-Update Training with Dynamic Expansion
-# -------------------------
-def main(data_dir="./data", checkpoint="toy_model_fast.npz", epochs=5, emb_dim=64, hidden_dim=256, context_size=4):
     os.makedirs(data_dir, exist_ok=True)
 
-    # Convert CSV/JSON datasets to txt
+    # Step 1: convert datasets to txt
     convert_datasets_to_txt(data_dir)
 
-    # Load corpus
+    # Step 2: load corpus
     text, file_hashes = load_corpus(data_dir)
     if not text.strip():
-        print("No text data found in ./data folder.")
+        print("No text data found in", data_dir)
         return
 
-    # Load or create model
-    if os.path.exists(checkpoint):
-        print("🔄 Loading existing model...")
-        weights = np.load(checkpoint, allow_pickle=True)
-        meta = json.loads(str(weights["meta"]))
+    # Step 3: load existing checkpoint metadata if present
+    meta_path = checkpoint_prefix + ".meta.json"
+    weights_path = checkpoint_prefix + ".weights.npz"
+    stoi = None
+    itos = None
+    model = None
+
+    if os.path.exists(meta_path) and os.path.exists(weights_path):
+        print("Loading existing checkpoint metadata...")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
         stoi = meta["stoi"]
         itos = {int(k): v for k, v in meta["itos"].items()}
-        vocab_size = len(stoi)
+        old_vocab_size = len(stoi)
 
-        model = TinyLM(vocab_size, emb_dim=emb_dim, hidden_dim=hidden_dim, context_size=context_size)
-        model.W_emb = weights["W_emb"].astype(model.dtype)
-        model.W1 = weights["W1"].astype(model.dtype)
-        model.b1 = weights["b1"].astype(model.dtype)
-        model.W2 = weights["W2"].astype(model.dtype)
-        model.b2 = weights["b2"].astype(model.dtype)
-
-        tokens = set(text.strip().split())
-        new_words = [tok for tok in tokens if tok not in stoi]
+        # build token ids for new corpus
+        tokens = text.strip().split()
+        token_set = set(tokens)
+        new_words = [w for w in token_set if w not in stoi]
         if new_words:
-            model.expand_vocab(new_words)
-            for i, tok in enumerate(new_words):
-                idx = vocab_size + i
-                stoi[tok] = idx
-                itos[idx] = tok
+            print(f"Found {len(new_words)} new words — expanding vocab...")
+            # extend stoi/itos
+            for w in new_words:
+                idx = len(stoi)
+                stoi[w] = idx
+                itos[idx] = w
+            new_vocab_size = len(stoi)
+        else:
+            new_vocab_size = old_vocab_size
 
-        data = encode(text, stoi)
-        train(model, data, epochs=epochs, lr=0.005, batch_size=512)
+        # load saved weights (npz)
+        npz = np.load(weights_path, allow_pickle=True)
+        saved_weights = dict(npz)
 
-        meta["file_hashes"] = file_hashes
+        # build model with new vocab size and copy weights
+        # For safe building, construct old model to inspect layer sizes
+        old_model = build_model(old_vocab_size, emb_dim=emb_dim, context_size=context_size)
+        # create old model variables by calling once
+        dummy = np.zeros((1, context_size*2), dtype=np.int32)
+        old_model(dummy, training=False)
+        model = rebuild_and_load_weights(old_model, new_vocab_size, saved_weights)
     else:
-        print("✨ Creating new model...")
-        vocab, stoi, itos = build_vocab(text, max_vocab=50000)
-        model = TinyLM(len(vocab), emb_dim=emb_dim, hidden_dim=hidden_dim, context_size=context_size)
-        data = encode(text, stoi)
-        train(model, data, epochs=epochs, lr=0.005, batch_size=512)
+        # Create new vocab + model
+        print("Creating new model and vocab...")
+        vocab, stoi, itos = build_vocab(text, max_vocab=args.max_vocab)
+        new_vocab_size = len(vocab)
+        model = build_model(new_vocab_size, emb_dim=emb_dim, context_size=context_size)
 
-        meta = {"stoi": stoi, "itos": itos, "file_hashes": file_hashes}
+    # Prepare data
+    token_ids = encode_to_ids(text, stoi)
+    ds = make_dataset(token_ids, context_size=context_size, batch_size=batch_size, shuffle=True)
 
-    # Save model + meta
-    meta_str = json.dumps(meta)
-    np.savez(checkpoint,
-             W_emb=model.W_emb.astype(np.float32), W1=model.W1.astype(np.float32), b1=model.b1.astype(np.float32),
-             W2=model.W2.astype(np.float32), b2=model.b2.astype(np.float32),
-             meta=np.array(meta_str))
-    print("✅ Model saved:", checkpoint)
+    # Compile model
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    model.compile(optimizer=optimizer, loss=loss_fn, metrics=["sparse_categorical_accuracy"])
+
+    # Callback to save weights each epoch
+    class SaveWeightsCallback(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            # save weights to npz
+            weights = {}
+            for var in model.trainable_variables:
+                weights[var.name] = var.numpy()
+            np.savez(checkpoint_prefix + ".weights.npz", **weights)
+            # save meta
+            meta = {"stoi": stoi, "itos": itos, "file_hashes": file_hashes}
+            with open(checkpoint_prefix + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            print(f"[Checkpoint] saved weights + meta (epoch {epoch+1})")
+
+    # Fit
+    model.fit(ds, epochs=epochs, callbacks=[SaveWeightsCallback()])
+
+    # Final save
+    weights = {}
+    for var in model.trainable_variables:
+        weights[var.name] = var.numpy()
+    np.savez(checkpoint_prefix + ".weights.npz", **weights)
+    meta = {"stoi": stoi, "itos": itos, "file_hashes": file_hashes}
+    with open(checkpoint_prefix + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+    print("Training complete. Model + meta saved to:", checkpoint_prefix + ".*")
 
 if __name__ == "__main__":
-    print("NUMBA_AVAILABLE =", NUMBA_AVAILABLE)
-    main(epochs=5, emb_dim=64, hidden_dim=256, context_size=4)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="./data")
+    parser.add_argument("--checkpoint", type=str, default="toy_tf_model")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--emb_dim", type=int, default=64)
+    parser.add_argument("--context_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--max_vocab", type=int, default=50000)
+    args = parser.parse_args()
+    main(args)
